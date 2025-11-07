@@ -182,7 +182,7 @@ function Attempt-Retrieve {
                 $sResponse1 = Send-Receive -Sock $sock -IP $IP -Data $data -Port $Port
                 $iMessageLength = $sResponse1[14]
                 if ($sResponse1[17] -eq 18) {
-                    Write-Host "[-] Invalid username: $User"
+                    # Write-Host "[-] Invalid username: $User"
                     return
                 }
                 if ($iMessageLength -eq 60) {
@@ -245,7 +245,9 @@ function Invoke-IPMIDump {
         [switch]$IncludeDisabled,
 
         [Parameter()]
-        [int]$Port = 623
+        [int]$Port = 623,
+		
+		[switch] $NoPortScan
     )
 
     function Get-DomainUsers {
@@ -285,6 +287,80 @@ function Invoke-IPMIDump {
     } else {
         $ipAddresses = @($IP)
     }
+	
+	if(!$NoPortScan){
+		$runspacePool = [runspacefactory]::CreateRunspacePool(1, 10)
+		$runspacePool.Open()
+	
+		$scriptBlock = {
+			param ($computer, $Port)
+
+			# local defaults inside the block (no extra args needed)
+			$timeoutMs = 300
+
+			# Pick a tiny probe; proper RMCP Presence Ping for IPMI (UDP 623)
+			$packet = if ($Port -eq 623) {
+				# RMCP/ASF Presence Ping (12 bytes)
+				[byte[]](0x06,0x00,0xFF,0x06,0x00,0x00,0x11,0xBE,0x80,0x00,0x00,0x00)
+			} else {
+				[byte[]](0x00)
+			}
+
+			# Open UDP client to remote host:port
+			$socket = New-Object System.Net.Sockets.UdpClient($computer, $Port)
+			$socket.Client.ReceiveTimeout = $timeoutMs
+			try {
+				# Send probe
+				[void]$socket.Send($packet, $packet.Length)
+
+				# Prepare receive endpoint and block (with timeout) for any reply
+				$recv = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Any, 0)
+				$received = $socket.Receive([ref]$recv)
+
+				if ($received -and $received.Length -gt 0) {
+					return $computer  # treat reply as "open"
+				}
+			}
+			catch [System.Net.Sockets.SocketException] {
+				# 10060 == timeout (open|filtered) → return $null to avoid false positives
+				# 10054 == ICMP port unreachable (closed) → return $null
+				return $null
+			}
+			catch { return $null }
+			finally { $socket.Close() }
+		}
+	
+		$runspaces = New-Object 'System.Collections.Generic.List[System.Object]'
+	
+		foreach ($computer in $ipAddresses) {
+			$powerShellInstance = [powershell]::Create().AddScript($scriptBlock).AddArgument($computer).AddArgument($Port)
+			$powerShellInstance.RunspacePool = $runspacePool
+			$runspaces.Add([PSCustomObject]@{
+				Instance = $powerShellInstance
+				Status   = $powerShellInstance.BeginInvoke()
+			})
+		}
+	
+		$reachable_hosts = @()
+		foreach ($runspace in $runspaces) {
+			$result = $runspace.Instance.EndInvoke($runspace.Status)
+			if ($result) {
+				$reachable_hosts += $result
+			}
+		}
+	
+		$ipAddresses = $reachable_hosts
+	
+		$runspacePool.Close()
+		$runspacePool.Dispose()
+	}
+	
+	if(!$ipAddresses){
+		Write-Output ""
+		Write-Output "[-] No Hosts found where port $Port is open"
+		Write-Output ""
+		break
+	}
 
     foreach ($ip in $ipAddresses) {
         $global:IPMI_halt = $false
